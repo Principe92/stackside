@@ -1,0 +1,7 @@
+# written by Claude Code when it loads the mod
+.claude-plugin/types/
+# a local netcoredbg copy (dotnet_setup installs into the plugin's data folder instead)
+vendor/
+node_modules/
+*.log
+.DS_Store
