@@ -76,7 +76,7 @@ rl.on('line', async (line) => {
   const { id, method, params } = msg;
   try {
     if (method === 'initialize') {
-      return send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stackside', version: '0.1.0' }, instructions: 'Debug the user\'s web frontend (Chrome, TypeScript breakpoints) and .NET backend (netcoredbg) from Claude Code. Typical flow: dotnet_breakpoint + dotnet_launch for the API; web_open the Angular dev server; web_snapshot then web_click/web_type to drive it; when something pauses, read dotnet_state / js_state, inspect, then *_step continue. web_show visible=true hands the same browser window to the user in Chrome.' } });
+      return send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stackside', version: '0.1.1' }, instructions: 'Debug the user\'s web frontend (Chrome, TypeScript breakpoints) and .NET backend (netcoredbg) from Claude Code. Typical flow: dotnet_breakpoint + dotnet_launch for the API; web_open the Angular dev server; web_snapshot then web_click/web_type to drive it; when something pauses, read dotnet_state / js_state, inspect, then *_step continue. web_show visible=true hands the same browser window to the user in Chrome.' } });
     }
     if (method === 'notifications/initialized' || method?.startsWith('notifications/')) return;
     if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} });
