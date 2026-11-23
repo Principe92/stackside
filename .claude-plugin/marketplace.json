@@ -1,6 +1,6 @@
 {
   "name": "stackside",
-  "description": "Stackside: debug a web frontend and a .NET backend from inside Claude Code.",
   "owner": { "name": "Princewill Okorie" },
+  "metadata": { "description": "Stackside: debug a web frontend and a .NET backend from inside Claude Code." },
   "plugins": [{ "name": "stackside", "source": "./" }]
 }
