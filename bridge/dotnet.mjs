@@ -2,6 +2,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve, basename, isAbsolute } from 'node:path';
+import { snippet } from './sourcemap.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const run = (cmd, args, opts = {}) => new Promise((res) => execFile(cmd, args, { maxBuffer: 20 * 1024 * 1024, windowsHide: true, ...opts }, (err, stdout, stderr) => res({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) })));
@@ -235,6 +236,7 @@ export class DotNet {
       else p.frames = await this.#frames(b.threadId);
       // locals only make sense in a frame with source; a native frame answers 'variables' with E_FAIL
       const top = p.frames.find((f) => f.file) || p.frames[0];
+      p.frame = Math.max(0, p.frames.indexOf(top));
       if (top?.file) {
         try { p.locals = await this.#scopeVars(top.id); } catch (e) { p.localsError = e.message; }
       }
@@ -345,9 +347,9 @@ export class DotNet {
     return variables.slice(0, 200).map((v) => ({ name: v.name, type: v.type, value: String(v.value).slice(0, 1000), ref: v.variablesReference || undefined }));
   }
 
-  async evaluate(expression, frameIndex = 0) {
+  async evaluate(expression, frameIndex) {
     if (!this.dap) throw new Error('no session');
-    const frame = this.paused?.frames?.[frameIndex];
+    const frame = this.paused?.frames?.[frameIndex ?? this.paused?.frame ?? 0];
     const r = await this.dap.request('evaluate', { expression, frameId: frame?.id, context: 'repl' });
     return { value: r.result, type: r.type, ref: r.variablesReference || undefined };
   }
@@ -358,15 +360,25 @@ export class DotNet {
     return rows.slice(-limit);
   }
 
-  pauseState() {
+  /** `frame`: show that call-stack frame's locals and source (and use it for dotnet_eval) until the next pause. */
+  async pauseState(frame) {
     if (!this.paused) return { paused: false, state: this.state };
+    const pick = this.paused.frames[frame];
+    if (frame != null && frame !== this.paused.frame && pick) {
+      this.paused.frame = frame; this.paused.locals = []; delete this.paused.localsError;
+      if (pick.file) { try { this.paused.locals = await this.#scopeVars(pick.id); } catch (e) { this.paused.localsError = e.message; } }
+    }
+    const at = this.paused.frames[this.paused.frame ?? 0];
+    let source = null;
+    if (at?.path) { try { source = snippet(readFileSync(at.path, 'utf8'), at.line, at.path); } catch { /* file moved or unreadable */ } }
     const { frames, threadId, ...rest } = this.paused;
+    rest.source = source;
     let shown = frames.map(({ id, path, ...f }, index) => ({ index, ...f }));
     let hiddenFrames;
     if (shown.length > 30) { // long framework stacks: keep the top and every frame in the user's code
       const keep = shown.filter((f) => f.index < 12 || f.file);
       hiddenFrames = shown.length - keep.length; shown = keep;
-    } else shown = shown.map(({ index, ...f }) => f);
+    }
     return { paused: true, ...rest, thread: threadId, frames: shown, hiddenFrames };
   }
 

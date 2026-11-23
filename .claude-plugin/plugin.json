@@ -1,6 +1,6 @@
 {
   "name": "stackside",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Debug an Angular (or any web) frontend and a .NET backend without leaving Claude Code: a live, drivable browser pane you can hand off to Chrome, TypeScript and C# breakpoints, stepping, locals and eval.",
   "author": { "name": "Princewill Okorie", "url": "https://github.com/principe92" },
   "homepage": "https://github.com/principe92/stackside",

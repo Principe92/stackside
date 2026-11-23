@@ -42,6 +42,7 @@ export class SourceMap {
     this.mapUrl = mapUrl;
     const root = m.sourceRoot ? m.sourceRoot.replace(/\/?$/, '/') : '';
     this.sources = (m.sources || []).map((s) => root + s);
+    this.contents = m.sourcesContent || [];
     this.normSources = this.sources.map(normPath);
     // generated-ordered segments: [genLine, genCol, srcIdx, srcLine, srcCol]
     this.segments = [];
@@ -113,6 +114,18 @@ export class SourceMap {
       // allow falling back to the previous line's last mapping
       if (genLine - seg[0] > 2) return null;
     }
-    return { source: this.sources[seg[2]], line: seg[3], column: seg[4] };
+    return { source: this.sources[seg[2]], src: seg[2], line: seg[3], column: seg[4] };
   }
+
+  /** The original text of source `src`, when the map embeds it (sourcesContent). */
+  contentOf(src) { return typeof this.contents[src] === 'string' ? this.contents[src] : null; }
+}
+
+/** Lines around 1-based `line` of `text`, for the pane's source view. */
+export function snippet(text, line, path, before = 6, after = 6) {
+  if (typeof text !== 'string' || !line) return null;
+  const all = text.split(/\r?\n/);
+  const startLine = Math.max(1, line - before);
+  const lines = all.slice(startLine - 1, Math.min(all.length, line + after)).map((l) => l.replace(/\t/g, '  ').slice(0, 240));
+  return lines.length ? { path, line, startLine, lines } : null;
 }

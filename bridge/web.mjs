@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { SourceMap, normPath } from './sourcemap.mjs';
+import { SourceMap, normPath, snippet } from './sourcemap.mjs';
 
 const CHROME_CANDIDATES = [
   process.env.STACKSIDE_CHROME,
@@ -238,31 +238,59 @@ export class Web {
   }
 
   async #onPaused(p) {
-    const frames = [];
-    for (const f of p.callFrames.slice(0, 25)) frames.push({ fn: f.functionName || '(anonymous)', ...this.#orig(f.location), callFrameId: f.callFrameId });
-    let locals = [];
-    try {
-      const top = p.callFrames[0];
-      for (const scope of top.scopeChain.filter((sc) => sc.type === 'local' || sc.type === 'block' || sc.type === 'closure').slice(0, 3)) {
-        const { result } = await this.send('Runtime.getProperties', { objectId: scope.object.objectId, ownProperties: true, generatePreview: true }, 4000);
-        for (const prop of result.slice(0, 40)) locals.push({ scope: scope.type, name: prop.name, value: fmtRemote(prop.value || {}) });
-      }
-      if (top.this && top.this.type === 'object') locals.unshift({ scope: 'this', name: 'this', value: fmtRemote(top.this) });
-    } catch (e) { this.log('locals: ' + e.message); }
+    this.objects = new Map(); this.nextRef = 1; // refs into this pause's objects, for js_variables
+    const raw = p.callFrames.slice(0, 25);
+    const frames = raw.map((f) => ({ fn: f.functionName || '(anonymous)', ...this.#orig(f.location), callFrameId: f.callFrameId }));
+    const locals = await this.#localsOf(raw[0]);
     const hitBp = this.breakpoints.find((bp) => bp.cdpIds.some((c) => (p.hitBreakpoints || []).includes(c.breakpointId)));
     this.paused = {
       at: Date.now(), reason: p.reason === 'other' && hitBp ? 'breakpoint' : p.reason,
       breakpoint: hitBp?.id, exception: p.reason === 'exception' ? fmtRemote(p.data || {}) : undefined,
-      frames, locals,
+      frames, locals, raw, frame: 0,
     };
     this.onPause?.(this.paused);
+  }
+
+  #ref(v) {
+    if (!v?.objectId || v.type !== 'object' || v.subtype === 'null') return undefined;
+    const ref = this.nextRef++;
+    this.objects.set(ref, v.objectId);
+    return ref;
+  }
+
+  async #localsOf(cf) {
+    const locals = [];
+    if (!cf) return locals;
+    try {
+      for (const scope of cf.scopeChain.filter((sc) => sc.type === 'local' || sc.type === 'block' || sc.type === 'closure').slice(0, 3)) {
+        const { result } = await this.send('Runtime.getProperties', { objectId: scope.object.objectId, ownProperties: true, generatePreview: true }, 4000);
+        for (const prop of result.slice(0, 40)) locals.push({ scope: scope.type, name: prop.name, value: fmtRemote(prop.value || {}), ref: this.#ref(prop.value) });
+      }
+      if (cf.this && cf.this.type === 'object') locals.unshift({ scope: 'this', name: 'this', value: fmtRemote(cf.this), ref: this.#ref(cf.this) });
+    } catch (e) { this.log('locals: ' + e.message); }
+    return locals;
+  }
+
+  /** Expand an object local (its `ref` from js_state or js_variables). */
+  async variables(ref) {
+    const objectId = this.objects?.get(Number(ref));
+    if (!objectId || !this.paused) throw new Error('no object ' + ref + ' (refs last until the page resumes)');
+    const { result } = await this.send('Runtime.getProperties', { objectId, ownProperties: true, generatePreview: true }, 4000);
+    return result.filter((p) => p.value && !p.name.startsWith('__')).slice(0, 200)
+      .map((p) => ({ name: p.name, value: fmtRemote(p.value), ref: this.#ref(p.value) }));
   }
 
   #orig(loc) {
     const s = this.scripts.get(loc.scriptId);
     const o = s?.map?.originalFor(loc.lineNumber, loc.columnNumber || 0);
-    if (o) return { file: shortPath(o.source), line: o.line + 1, column: o.column + 1 };
+    if (o) return { file: shortPath(o.source), line: o.line + 1, column: o.column + 1, scriptId: loc.scriptId, src: o.src };
     return { file: shortUrl(s?.url || loc.scriptId), line: loc.lineNumber + 1, column: (loc.columnNumber || 0) + 1, generated: true };
+  }
+
+  #sourceOf(f) {
+    if (!f || f.generated || f.src == null) return null;
+    const map = this.scripts.get(f.scriptId)?.map;
+    return snippet(map?.contentOf(f.src), f.line, f.file);
   }
 
   // ---------- page control ----------
@@ -451,7 +479,7 @@ export class Web {
     await this.ensure();
     let r;
     if (this.paused) {
-      const f = this.paused.frames[frameIndex || 0];
+      const f = this.paused.frames[frameIndex ?? this.paused.frame ?? 0];
       r = await this.send('Debugger.evaluateOnCallFrame', { callFrameId: f.callFrameId, expression, returnByValue: false, generatePreview: true });
     } else {
       r = await this.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: false, generatePreview: true, userGesture: true });
@@ -524,10 +552,15 @@ export class Web {
     return { pauseOnExceptions: state };
   }
 
-  pauseState() {
+  /** `frame`: show that call-stack frame's locals and source (and use it for web_eval) until the next pause. */
+  async pauseState(frame) {
     if (!this.paused) return { paused: false };
-    const { frames, ...rest } = this.paused;
-    return { paused: true, ...rest, frames: frames.map(({ callFrameId, ...f }) => f) };
+    if (frame != null && frame !== this.paused.frame && this.paused.raw[frame]) {
+      this.paused.locals = await this.#localsOf(this.paused.raw[frame]);
+      this.paused.frame = frame;
+    }
+    const { frames, raw, ...rest } = this.paused;
+    return { paused: true, ...rest, source: this.#sourceOf(frames[rest.frame]), frames: frames.map(({ callFrameId, scriptId, src, ...f }) => f) };
   }
 
   status() {
