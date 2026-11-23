@@ -37,7 +37,13 @@ let paneOpen = false
 
 async function bridge($: EngineInterface): Promise<string> {
   if (server) return server
-  const r = (await $.mcp.connect('stackside')) as { isConnected?: boolean; server?: string; reason?: string; message?: string }
+  type Conn = { isConnected?: boolean; server?: string; reason?: string; message?: string }
+  let r = (await $.mcp.connect('stackside')) as Conn
+  // a session that loaded the mod before its rename still knows the bridge as "devdebug"
+  if (!r.isConnected) {
+    const old = (await $.mcp.connect('devdebug')) as Conn
+    if (old.isConnected) r = old
+  }
   if (!r.isConnected || !r.server) throw new Error('debug bridge not connected: ' + (r.message ?? r.reason ?? 'unknown'))
   server = r.server
   return server
@@ -59,7 +65,7 @@ async function act($: EngineInterface, label: string, fn: () => Promise<unknown>
   try { await fn() } catch (err) { lastError = String((err as Error)?.message ?? err) }
   busy = ''
   await refresh($, true)
-  void grabFrame($)
+  pictureSoon($)
 }
 
 function where(l?: Loc | null): string {
@@ -102,38 +108,76 @@ async function refresh($: EngineInterface, details = false) {
       webBps = next.web.breakpoints ? await call<Bp[]>($, 'js_breakpoints') : []
       netBps = next.dotnet.breakpoints ? await call<Bp[]>($, 'dotnet_breakpoints') : []
     }
-    void $.ui.status(statusLine())
+    const line = statusLine()
+    if (line !== lastStatusLine) { lastStatusLine = line; void $.ui.status(line) }
   } catch (err) {
     lastError = String((err as Error)?.message ?? err)
   } finally {
     inFlightStatus = false
-    redraw($)
+    syncPolling($)
+    // redraw only when something on screen changed: every redraw re-sends the page picture, which flickers
+    const print = JSON.stringify([status?.web, status?.dotnet, webPause, netPause, webBps, netBps, lastError, tab])
+    if (details || print !== lastPrint) { lastPrint = print; redraw($) }
   }
 }
+let lastPrint = ''
+let lastStatusLine: string | undefined = '\u0000'
 
 async function grabFrame($: EngineInterface) {
   if (inFlightFrame || !paneOpen || tab !== 'browser' || !status?.web.running || status.web.paused) return
   inFlightFrame = true
   try {
     const f = await call<Frame | null>($, 'pane_frame', { maxChars: 128000, width: 960 })
-    if (f && f.data) { frame = f; redraw($) }
+    if (f && f.data && f.data !== frame?.data) { frame = f; redraw($) }
   } catch { /* the next tick tries again */ } finally { inFlightFrame = false }
 }
 
+// The desktop app redraws the whole pane after every bridge call the pane makes, so the pane never polls
+// while nothing can change on its own. The picture updates after each action (now and once more a moment
+// later, for pages that settle); status is polled, slowly, only while a debug session could pause by itself.
+function needsWatch(): boolean {
+  if (!status) return false
+  const n = status.dotnet, w = status.web
+  return n.state === 'running' || n.state === 'starting' || n.state === 'building' || !!n.paused ||
+    !!w.paused || (w.running && (w.breakpoints > 0 || w.visible))
+}
+
+function syncPolling($: EngineInterface) {
+  const want = paneOpen && needsWatch()
+  if (want && !polling) polling = $.clock.every(3000, () => { void refresh($) })
+  if (!want && polling) { polling.cancel(); polling = null }
+}
+
+function pictureSoon($: EngineInterface) {
+  void grabFrame($)
+  framing?.cancel()
+  framing = $.clock.after(1200, () => { framing = null; void grabFrame($) })
+}
+
+// once per load: the render hook calls this on every draw, and a refresh that redraws must not loop
+let kicked = false
 function startPolling($: EngineInterface) {
-  if (!polling) polling = $.clock.every(1200, () => { void refresh($) })
-  if (!framing) framing = $.clock.every(700, () => { void grabFrame($) })
+  if (kicked) return
+  kicked = true
+  void refresh($, true).then(() => pictureSoon($))
 }
 
 async function openPane($: EngineInterface) {
   const r = await $.ui.open({ id: PANE, title: TITLE })
   paneOpen = true
-  startPolling($)
-  void refresh($, true)
+  kicked = true
+  void refresh($, true).then(() => pictureSoon($))
   return r
 }
 
+// the same frame always yields the very same string, so an unchanged picture is never re-sent as new
+let svgCache: { data: string; svg: string } | null = null
 function svgFor(f: Frame): string {
+  if (svgCache?.data === f.data) return svgCache.svg
+  svgCache = { data: f.data, svg: svgOf(f) }
+  return svgCache.svg
+}
+function svgOf(f: Frame): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${f.width}" height="${f.height}" viewBox="0 0 ${f.width} ${f.height}"><image width="${f.width}" height="${f.height}" href="data:image/jpeg;base64,${f.data}"/></svg>`
 }
 
@@ -174,25 +218,10 @@ export const register: Register = on => {
     return { text: 'Stopped the .NET debug session.' }
   })
 
-  // Clicks and keys from the picture of the page.
-  on('ui.message', async ($, e, next) => {
-    const data = (e as unknown as { data?: { kind?: string; fx?: number; fy?: number; key?: string } }).data
-    if (!data?.kind) return next(e)
-    if (data.kind === 'click' && typeof data.fx === 'number' && typeof data.fy === 'number') {
-      const fx = data.fx, fy = data.fy
-      void act($, 'Clicking', () => call($, 'web_click', { fx, fy }))
-    } else if (data.kind === 'key' && data.key) {
-      const map: Record<string, string> = { return: 'Enter', tab: 'Tab', backspace: 'Backspace', delete: 'Delete', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', pageup: 'PageUp', pagedown: 'PageDown', home: 'Home', end: 'End', space: 'Space', ' ': 'Space' }
-      const k = map[data.key] ?? data.key
-      void act($, '', () => (k.length === 1 ? call($, 'web_type', { text: k }) : call($, 'web_key', { key: k })))
-    }
-    return next(e)
-  })
-
   // Seeing Claude's own bridge calls keeps the pane current right away.
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
-    if (String(e.tool).includes('stackside') && paneOpen) { void refresh($, true); void grabFrame($) }
+    if (/stackside|devdebug/.test(String(e.tool)) && paneOpen) { void refresh($, true).then(() => pictureSoon($)) }
     return result
   })
 
@@ -200,7 +229,6 @@ export const register: Register = on => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const el = $.ui.resolve(e) as unknown as Record<string, ((p: unknown) => unknown) | undefined>
     const Svg = el.Svg as unknown as ((p: { source: string; alt: string; width?: number }) => JSX.Element) | undefined
-    const Client = el.Client as unknown as ((p: { key: string; module: string; props?: unknown; width?: number | string; height?: number | string }) => JSX.Element) | undefined
     const Code = el.Code as unknown as ((p: { source: string; language?: string }) => JSX.Element) | undefined
     paneOpen = true
     startPolling($)
@@ -214,7 +242,7 @@ export const register: Register = on => {
 
     const header = (
       <Box flexDirection="row" gap={1}>
-        <Button key="tab-browser" variant={tab === 'browser' ? 'primary' : undefined} onPress={() => { tab = 'browser'; redraw($); void grabFrame($) }}>Browser</Button>
+        <Button key="tab-browser" variant={tab === 'browser' ? 'primary' : undefined} onPress={() => { tab = 'browser'; redraw($); pictureSoon($) }}>Browser</Button>
         <Button key="tab-debugger" variant={tab === 'debugger' ? 'primary' : undefined} onPress={() => { tab = 'debugger'; void refresh($, true) }}>
           {`Debugger${w?.paused || n?.paused ? ' ⏸' : ''}`}
         </Button>
@@ -236,6 +264,7 @@ export const register: Register = on => {
             <Button key="fwd" onPress={() => act($, 'Forward', () => call($, 'web_nav', { action: 'forward' }))}>▶</Button>
             <Button key="up" onPress={() => act($, '', () => call($, 'web_scroll', { dy: -500 }))}>Scroll ↑</Button>
             <Button key="down" onPress={() => act($, '', () => call($, 'web_scroll', { dy: 500 }))}>Scroll ↓</Button>
+            <Button key="snap" onPress={() => pictureSoon($)}>Update picture</Button>
             <Button key="elements" onPress={async () => {
               showElements = !showElements
               if (showElements) { try { const s = await call<{ items: string[] }>($, 'web_snapshot'); elements = s.items } catch (err) { lastError = String(err) } }
@@ -249,16 +278,8 @@ export const register: Register = on => {
           {visibleInChrome && <Text dimColor>This page is also showing in a Chrome window: same tab, same sign-in, breakpoints still on. Use either.</Text>}
           {!w?.running && <Text dimColor>No browser yet. Enter a URL above, run /debug-web localhost:4200, or ask Claude to open the app.</Text>}
           {w?.paused && <Text color="yellow">{`Page paused at ${where(w.paused.at)}: open the Debugger tab to step.`}</Text>}
-          {w?.running && frame && Svg && (
-            <Box position="relative" flexDirection="column">
-              <Svg source={svgFor(frame)} alt={`${w.title || 'page'}: ${w.url}`} />
-              {Client && (
-                <Box position="absolute" top={0} left={0} right={0} bottom={0}>
-                  <Client key="pad" module="./clickpad.tsx" props={{ hint: 'click' }} width="100%" height="100%" />
-                </Box>
-              )}
-            </Box>
-          )}
+          {/* no click layer over the picture: the overlaid client surface made the picture flicker */}
+          {w?.running && frame && Svg && <Svg key="page" source={svgFor(frame)} alt={`${w.title || 'page'}: ${w.url}`} />}
           {w?.running && !Svg && <Text dimColor>{`${w.title} (${w.url}): this surface can't draw the page; use Open in Chrome.`}</Text>}
           {w?.running && (
             <Box flexDirection="row" gap={1} flexWrap="wrap">

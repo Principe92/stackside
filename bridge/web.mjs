@@ -117,6 +117,8 @@ export class Web {
     ]);
     await s('Debugger.setPauseOnExceptions', { state: this.pauseOnExceptions });
     await s('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+    // an older bridge's scaled screenshots could leave the page laid out for a smaller screen than its window
+    await s('Emulation.clearDeviceMetricsOverride').catch(() => {});
     try { const w = await this.cdp.send('Browser.getWindowForTarget', { targetId }); this.windowId = w.windowId; } catch { /* */ }
     for (const bp of this.breakpoints) bp.cdpIds = [];
   }
@@ -283,6 +285,7 @@ export class Web {
     await this.cdp.send('Browser.setWindowBounds', { windowId: this.windowId, bounds: { windowState: 'normal' } });
     const bounds = visible ? { left: 80, top: 40, width: VIEW.width, height: VIEW.height } : { ...OFFSCREEN, width: VIEW.width, height: VIEW.height };
     await this.cdp.send('Browser.setWindowBounds', { windowId: this.windowId, bounds });
+    await this.send('Emulation.clearDeviceMetricsOverride').catch(() => {});
     if (visible) await this.send('Page.bringToFront');
     this.visible = visible;
     return this.status();
@@ -292,14 +295,42 @@ export class Web {
     await this.ensure();
     const m = await this.send('Runtime.evaluate', { expression: 'JSON.stringify([innerWidth, innerHeight])', returnByValue: true }, 2500).catch(() => null);
     const [vw, vh] = m ? JSON.parse(m.result.value) : [this.lastFrame?.viewport?.[0] || VIEW.width, this.lastFrame?.viewport?.[1] || VIEW.height];
+    // A scaled or clipped Page.captureScreenshot makes Chrome emulate a smaller screen for the capture, which a
+    // visible window shows as the page shrinking and folding. A screencast frame is scaled by the compositor
+    // instead and leaves the page's layout alone.
     let scale = Math.min(1, width / vw), quality = 60, shot;
-    for (let i = 0; i < 5; i++) {
-      shot = await this.send('Page.captureScreenshot', { format: 'jpeg', quality, clip: { x: 0, y: 0, width: vw, height: vh, scale }, captureBeyondViewport: false }, 6000);
+    for (let i = 0; i < 6; i++) {
+      shot = await this.#castFrame(Math.round(vw * scale), Math.round(vh * scale), quality);
       if (shot.data.length <= maxChars) break;
       if (quality > 35) quality -= 12; else scale *= 0.8;
     }
-    this.lastFrame = { data: shot.data, width: Math.round(vw * scale), height: Math.round(vh * scale), viewport: [vw, vh], at: Date.now() };
+    const w = shot.width || Math.round(vw * scale), h = shot.height || Math.round(vh * scale);
+    this.lastFrame = { data: shot.data, width: w, height: h, viewport: [vw, vh], at: Date.now() };
     return this.lastFrame;
+  }
+
+  /** One frame of a screencast at most maxWidth x maxHeight; falls back to a plain viewport screenshot. */
+  async #castFrame(maxWidth, maxHeight, quality) {
+    const session = this.session;
+    let off = () => {};
+    const got = new Promise((resolve) => {
+      off = this.cdp.on((m) => {
+        if (m.method !== 'Page.screencastFrame' || m.sessionId !== session) return;
+        this.send('Page.screencastFrameAck', { sessionId: m.params.sessionId }).catch(() => {});
+        resolve({ data: m.params.data });
+      });
+    });
+    try {
+      await this.send('Page.startScreencast', { format: 'jpeg', quality, maxWidth, maxHeight, everyNthFrame: 1 });
+      const r = await Promise.race([got, new Promise((res) => setTimeout(() => res(null), 1500))]);
+      if (r) return { data: r.data, width: 0, height: 0 };
+    } finally {
+      off();
+      await this.send('Page.stopScreencast').catch(() => {});
+    }
+    // no frame came (nothing repainted): an unscaled, unclipped capture changes nothing on screen either
+    const s = await this.send('Page.captureScreenshot', { format: 'jpeg', quality: Math.min(quality, 40) }, 6000);
+    return { data: s.data, width: 0, height: 0 };
   }
 
   async screenshot() {

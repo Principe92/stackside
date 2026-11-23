@@ -79,9 +79,10 @@ The browser side needs no setup.
 
 ### The pane
 
-- **Browser tab:** the live page, the URL bar, ◀ ⟳ ▶, scroll, a **Type** field and Enter / Tab / Esc / ⌫ keys,
-  a **Click** field (type a button's visible text), and **Elements**, a clickable list of the page's buttons, links
-  and fields. **Open in Chrome** hands the window to you; **Bring back here** takes it back.
+- **Browser tab:** a picture of the page, the URL bar, ◀ ⟳ ▶, scroll, a **Type** field and Enter / Tab / Esc / ⌫
+  keys, a **Click** field (type a button's visible text), and **Elements**, a clickable list of the page's buttons,
+  links and fields. The picture updates after each action, yours or Claude's; **Update picture** refreshes it
+  when the page changes by itself. **Open in Chrome** hands the window to you; **Bring back here** takes it back.
 - **Debugger tab:** for .NET and for the browser, where execution is paused and why, Continue / Step over /
   Step into / Step out, the call stack, the locals, and the breakpoints (✕ removes one).
 - **Status line:** shows `⏸ .NET OrderService.cs:57` or `● web localhost:4200/orders` while you work, and a toast
@@ -145,8 +146,11 @@ hooks/register.tsx
   you navigate to a lazy-loaded route.
 - **A C# breakpoint isn't verified.** It binds once the assembly with that file loads; check that the line has code
   on it and that you launched a Debug build.
-- **Clicking directly on the page picture does nothing.** Use **Elements**, the **Click** field, or
-  **Open in Chrome**. Direct clicks depend on the surface passing pointer events to the pane.
+- **Clicking the page picture does nothing.** It is a picture: use **Elements**, the **Click** field, or
+  **Open in Chrome**.
+- **The pane flickers now and then.** The desktop app redraws the pane after each call it makes to the bridge, so
+  the pane only checks for changes (every 3 seconds) while a debug session could pause on its own: a running .NET
+  app, a browser breakpoint, or the page open in Chrome.
 - **Port 9333 is in use.** Set `STACKSIDE_CHROME_PORT` to a free port.
 
 ## Develop
