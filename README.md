@@ -39,16 +39,20 @@ them, but they are less tested.
 At the prompt of a Claude Code terminal session:
 
 ```
-/plugin install stackside --marketplace principe92/stackside
+/plugin marketplace add principe92/stackside
+/plugin install stackside@stackside
 ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope makes it available in every session).
+If asked for a scope, pick user scope to make it available in every session.
 
-From a shell:
+From a shell (installs at user scope):
 
 ```
-claude plugin install stackside --marketplace principe92/stackside
+claude plugin marketplace add principe92/stackside
+claude plugin install stackside@stackside
 ```
+
+To update later, run `claude plugin update stackside@stackside` and restart Claude Code.
 
 In the desktop app, where `/plugin` doesn't run: click **+** next to the prompt box, then **Plugins**,
 **Add marketplace** with `principe92/stackside`, then **Add plugin**.
