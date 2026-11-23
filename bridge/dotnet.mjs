@@ -199,13 +199,45 @@ export class DotNet {
     }
   }
 
+  async #frames(threadId, levels = 30) {
+    const st = await this.dap.request('stackTrace', { threadId, startFrame: 0, levels });
+    return st.stackFrames.map((f) => ({ id: f.id, fn: f.name, file: f.source?.path ? this.#rel(f.source.path) : null, path: f.source?.path, line: f.line, column: f.column }));
+  }
+
+  /**
+   * A pause (break all) is reported on whichever thread the runtime picked, often an idle thread-pool worker.
+   * Show the thread that is in the user's code instead (the main thread when none is), and list the others.
+   */
+  async #pickThread(b) {
+    let threads = [];
+    try { ({ threads } = await this.dap.request('threads')); } catch { return null; }
+    const seen = [];
+    for (const t of threads.slice(0, 64)) {
+      let frames = [];
+      // deep: a blocked startup (e.g. an interactive sign-in) sits 70+ framework frames above Program.cs
+      try { frames = await this.#frames(t.id, 200); } catch { /* thread gone or not stoppable */ }
+      seen.push({ id: t.id, name: t.name, frames });
+    }
+    const pick = seen.find((t) => t.frames.some((f) => f.file)) || seen.find((t) => /main thread/i.test(t.name || '') && t.frames.length)
+      || seen.find((t) => t.frames.length) || seen[0];
+    const summary = seen.map((t) => {
+      const top = t.frames.find((f) => f.file) || t.frames[0];
+      return { id: t.id, name: t.name || undefined, at: top ? (top.file ? `${top.fn} (${top.file}:${top.line})` : top.fn) : null };
+    });
+    return pick ? { threadId: pick.id, frames: pick.frames, threads: summary, reported: b.threadId } : null;
+  }
+
   async #capturePause(b) {
     const p = { at: Date.now(), reason: b.reason, text: b.text, threadId: b.threadId, frames: [], locals: [] };
     try {
-      const st = await this.dap.request('stackTrace', { threadId: b.threadId, startFrame: 0, levels: 30 });
-      p.frames = st.stackFrames.map((f) => ({ id: f.id, fn: f.name, file: f.source?.path ? this.#rel(f.source.path) : null, path: f.source?.path, line: f.line, column: f.column }));
+      const picked = /^(pause|interrupt)$/i.test(b.reason || '') ? await this.#pickThread(b) : null;
+      if (picked) { p.threadId = picked.threadId; this.threadId = picked.threadId; p.frames = picked.frames; p.threads = picked.threads; }
+      else p.frames = await this.#frames(b.threadId);
+      // locals only make sense in a frame with source; a native frame answers 'variables' with E_FAIL
       const top = p.frames.find((f) => f.file) || p.frames[0];
-      if (top) p.locals = await this.#scopeVars(top.id);
+      if (top?.file) {
+        try { p.locals = await this.#scopeVars(top.id); } catch (e) { p.localsError = e.message; }
+      }
       if (b.reason === 'exception') {
         try { const ex = await this.dap.request('exceptionInfo', { threadId: b.threadId }); p.exception = { id: ex.exceptionId, message: ex.description || ex.details?.message, type: ex.details?.typeName, stack: ex.details?.stackTrace?.split('\n').slice(0, 8).join('\n') }; } catch { /* */ }
       }
@@ -329,7 +361,13 @@ export class DotNet {
   pauseState() {
     if (!this.paused) return { paused: false, state: this.state };
     const { frames, threadId, ...rest } = this.paused;
-    return { paused: true, ...rest, frames: frames.map(({ id, path, ...f }) => f) };
+    let shown = frames.map(({ id, path, ...f }, index) => ({ index, ...f }));
+    let hiddenFrames;
+    if (shown.length > 30) { // long framework stacks: keep the top and every frame in the user's code
+      const keep = shown.filter((f) => f.index < 12 || f.file);
+      hiddenFrames = shown.length - keep.length; shown = keep;
+    } else shown = shown.map(({ index, ...f }) => f);
+    return { paused: true, ...rest, thread: threadId, frames: shown, hiddenFrames };
   }
 
   status() {

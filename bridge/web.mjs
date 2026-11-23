@@ -134,6 +134,8 @@ export class Web {
     switch (m.method) {
       case 'Target.targetCrashed': case 'Target.detachedFromTarget': if (!m.sessionId || p.sessionId === this.session) this.session = null; break;
       case 'Page.frameNavigated': if (!p.frame.parentId) { this.url = p.frame.url; } break;
+      // SPA routers (history.pushState) never fire frameNavigated; a page target's main frame id is its targetId
+      case 'Page.navigatedWithinDocument': if (p.frameId === this.targetId) { this.url = p.url; this.#refreshTitle(); } break;
       case 'Page.domContentEventFired': this.#refreshTitle(); break;
       case 'Runtime.consoleAPICalled':
         this.#pushConsole(p.type, p.args.map(fmtRemote).join(' '), p.stackTrace?.callFrames?.[0]); break;
@@ -161,6 +163,27 @@ export class Web {
     const where = frame ? ` @ ${shortUrl(frame.url)}:${frame.lineNumber + 1}` : '';
     this.console.push({ t: Date.now(), level, text: String(text).slice(0, 4000) + where });
     if (this.console.length > 500) this.console.shift();
+  }
+
+  async #readUrl() {
+    if (this.paused) return this.url;
+    try { const r = await this.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, 2000); if (r.result.value) this.url = r.result.value; } catch { /* navigating */ }
+    return this.url;
+  }
+
+  /** After a click: wait until a navigation it started (full load or SPA route change) has settled. */
+  async #settleAfterClick(urlBefore) {
+    await sleep(150);
+    const t0 = Date.now();
+    let last = urlBefore, stableSince = Date.now();
+    while (Date.now() - t0 < 4000 && !this.paused) {
+      const u = await this.#readUrl();
+      if (u !== last) { last = u; stableSince = Date.now(); }
+      // nothing changed for 500 ms: done; changed and stable for 300 ms: done
+      if (Date.now() - stableSince >= (last === urlBefore ? 500 : 300)) break;
+      await sleep(100);
+    }
+    if (last !== urlBefore && !this.paused) { await this.#waitLoad(8000); await this.#readUrl(); await this.#refreshTitle(); }
   }
 
   async #refreshTitle() { try { const r = await this.send('Runtime.evaluate', { expression: 'document.title', returnByValue: true }, 3000); this.title = r.result.value || ''; } catch { /* */ } }
@@ -249,6 +272,7 @@ export class Web {
     this.netOrder = []; this.network.clear();
     await this.send('Page.navigate', { url });
     await this.#waitLoad();
+    await this.#readUrl();
     await this.#refreshTitle();
     return this.status();
   }
@@ -274,6 +298,7 @@ export class Web {
       if (e) await this.send('Page.navigateToHistoryEntry', { entryId: e.id });
     }
     await this.#waitLoad();
+    await this.#readUrl();
     await this.#refreshTitle();
     return this.status();
   }
@@ -377,12 +402,13 @@ export class Web {
     let x = target.x, y = target.y;
     if (target.fx != null) { const [vw, vh] = this.lastFrame?.viewport || [VIEW.width, VIEW.height]; x = target.fx * vw; y = target.fy * vh; }
     if (x == null) { const c = await this.#center(target); x = c.x; y = c.y; }
+    const before = await this.#readUrl();
     const base = { x, y, button: 'left', clickCount: 1 };
     await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
     await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...base });
     await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...base });
-    await sleep(350);
-    return { clicked: { x: Math.round(x), y: Math.round(y) }, url: this.url };
+    await this.#settleAfterClick(before);
+    return { clicked: { x: Math.round(x), y: Math.round(y) }, url: this.url, ...(this.paused ? { paused: true } : {}) };
   }
 
   async type({ text, ref, selector, clear, submit }) {
