@@ -1,5 +1,3 @@
-[![M8ven Score](https://m8ven.ai/badge/mcp/principe92-stackside-amy864?v=63b2668b12e186c10d5ae43e5b870966)](https://m8ven.ai/mcp/principe92-stackside-amy864?s=readme)
-
 # Stackside
 
 **Debug your web frontend and .NET backend without leaving Claude Code.**
